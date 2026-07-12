@@ -1,0 +1,7 @@
+build*/
+compile_commands.json
+.cache/
+*.o
+*.obj
+.clangd
+.DS_Store
