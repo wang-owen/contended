@@ -22,7 +22,6 @@ template <typename T, std::size_t Capacity> class SpscQueue {
 
 public:
   SpscQueue() = default;
-
   SpscQueue(const SpscQueue &) = delete;
   SpscQueue &operator=(const SpscQueue &) = delete;
 
