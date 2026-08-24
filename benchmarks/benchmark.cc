@@ -1,5 +1,10 @@
+#include "cds/hazard_lockfree_stack.h"
+#include "cds/lock_stack.h"
+#include "cds/mpmc_queue.h"
 #include "cds/mutex_queue.h"
+#include "cds/quiescent_lockfree_stack.h"
 #include "cds/spinlock_queue.h"
+#include "cds/split_ref_lockfree_stack.h"
 #include "cds/spsc_queue.h"
 
 #include <algorithm>
@@ -9,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -182,6 +188,107 @@ void run_latency_bench(const char *label, std::size_t message_count,
   report(label, run_index, stats, floor_p50_ns);
 }
 
+// Sustained throughput with multiple producers and consumers hammering one
+// queue instance. Unlike run_throughput_bench (one producer, one consumer),
+// this actually exercises MPMC contention. Times launch-to-join rather than
+// picking a precise warm-up cutpoint: with message_count in the hundreds of
+// thousands, thread-launch skew is noise.
+template <typename Queue>
+void run_contended_throughput_bench(const char *label,
+                                    std::size_t message_count,
+                                    std::size_t producers,
+                                    std::size_t consumers,
+                                    std::size_t run_index) {
+  Queue q;
+  std::atomic<std::size_t> produced{0};
+  std::atomic<std::size_t> consumed{0};
+
+  std::vector<std::thread> pool;
+  pool.reserve(producers + consumers);
+
+  const auto start = Clock::now();
+  for (std::size_t p = 0; p < producers; ++p) {
+    pool.emplace_back([&] {
+      while (true) {
+        std::size_t i = produced.fetch_add(1, std::memory_order_relaxed);
+        if (i >= message_count)
+          return;
+        while (!q.try_push(Payload{i})) { /* spin */
+        }
+      }
+    });
+  }
+  for (std::size_t c = 0; c < consumers; ++c) {
+    pool.emplace_back([&] {
+      while (true) {
+        std::size_t i = consumed.fetch_add(1, std::memory_order_relaxed);
+        if (i >= message_count)
+          return;
+        while (!q.try_pop()) { /* spin */
+        }
+      }
+    });
+  }
+  for (auto &t : pool)
+    t.join();
+  const auto end = Clock::now();
+
+  const double secs = std::chrono::duration<double>(end - start).count();
+  const double msgs = static_cast<double>(message_count);
+  std::printf("[%-8s] pad=%d run=%zu throughput=%.2f Mmsg/s\n", label,
+              kPaddingEnabled ? 1 : 0, run_index, msgs / secs / 1e6);
+}
+
+// Adapts LockStack's try_pop(T&) -> bool to the other stacks' pop() ->
+// unique_ptr<T>, so run_stack_throughput_bench can drive either shape.
+template <typename Stack>
+bool stack_try_pop(Stack &s, Payload &out) {
+  if constexpr (requires { s.try_pop(out); }) {
+    return s.try_pop(out);
+  } else {
+    auto p = s.pop();
+    if (!p)
+      return false;
+    out = *p;
+    return true;
+  }
+}
+
+// Each of thread_count threads pushes its share of message_count values then
+// pops the same number back off (spinning on empty), mirroring the balanced
+// push/pop pattern in tests/split_ref_lockfree_queue_test.cc. Times
+// launch-to-join.
+template <typename Stack>
+void run_stack_throughput_bench(const char *label, std::size_t message_count,
+                                std::size_t thread_count,
+                                std::size_t run_index) {
+  Stack s;
+  const std::size_t per_thread = message_count / thread_count;
+
+  std::vector<std::thread> pool;
+  pool.reserve(thread_count);
+
+  const auto start = Clock::now();
+  for (std::size_t t = 0; t < thread_count; ++t) {
+    pool.emplace_back([&] {
+      for (std::size_t i = 0; i < per_thread; ++i)
+        s.push(Payload{i});
+      Payload out;
+      for (std::size_t i = 0; i < per_thread; ++i)
+        while (!stack_try_pop(s, out)) { /* spin */
+        }
+    });
+  }
+  for (auto &t : pool)
+    t.join();
+  const auto end = Clock::now();
+
+  const double secs = std::chrono::duration<double>(end - start).count();
+  const double msgs = static_cast<double>(per_thread * thread_count);
+  std::printf("[%-8s] pad=%d run=%zu throughput=%.2f Mmsg/s\n", label,
+              kPaddingEnabled ? 1 : 0, run_index, msgs / secs / 1e6);
+}
+
 struct Bench {
   std::string_view name;
   void (*run_latency)(std::size_t message_count, std::size_t run_index,
@@ -216,6 +323,15 @@ const Bench benches[] = {
      [](std::size_t n, std::size_t r) {
        run_throughput_bench<cds::SpinlockQueue<Payload, kQueueCapacity>>(
            "spinlock_tp", n, r);
+     }},
+    {"mpmc",
+     [](std::size_t n, std::size_t r, double f) {
+       run_latency_bench<cds::MpmcQueue<Payload, kQueueCapacity>>("mpmc_lat",
+                                                                  n, r, f);
+     },
+     [](std::size_t n, std::size_t r) {
+       run_throughput_bench<cds::MpmcQueue<Payload, kQueueCapacity>>("mpmc_tp",
+                                                                     n, r);
      }},
 };
 
@@ -259,6 +375,44 @@ int main(int argc, char *argv[]) {
     for (const Bench &b : benches)
       if (selected(b.name))
         b.run_throughput(message_count, run_index);
+
+  // Contended MPMC: multiple producers and consumers on one queue, unlike
+  // the SPSC-style sections above. Always runs in full (small, fixed set).
+  constexpr std::size_t kContendedProducers = 4;
+  constexpr std::size_t kContendedConsumers = 4;
+  for (std::size_t run_index = 0; run_index < repeats; ++run_index) {
+    run_contended_throughput_bench<cds::MpmcQueue<Payload, kQueueCapacity>>(
+        "mpmc_c", message_count, kContendedProducers, kContendedConsumers,
+        run_index);
+    run_contended_throughput_bench<cds::SpinlockQueue<Payload, kQueueCapacity>>(
+        "spinlock_c", message_count, kContendedProducers, kContendedConsumers,
+        run_index);
+    run_contended_throughput_bench<cds::MutexQueue<Payload, kQueueCapacity>>(
+        "mutex_c", message_count, kContendedProducers, kContendedConsumers,
+        run_index);
+  }
+
+  // Stacks: same push/pop contract, different reclamation strategy. Run at
+  // two thread counts to show how the lock-free variants scale relative to
+  // the mutex baseline as contention increases.
+  for (std::size_t run_index = 0; run_index < repeats; ++run_index) {
+    for (std::size_t threads : {std::size_t{2}, std::size_t{8}}) {
+      const std::string suffix = std::to_string(threads);
+      run_stack_throughput_bench<cds::LockStack<Payload>>(
+          ("lock" + suffix).c_str(), message_count, threads, run_index);
+      run_stack_throughput_bench<cds::QuiescentLockFreeStack<Payload>>(
+          ("quies" + suffix).c_str(), message_count, threads, run_index);
+      run_stack_throughput_bench<cds::SplitRefLockFreeStack<Payload>>(
+          ("splitref" + suffix).c_str(), message_count, threads, run_index);
+      if (threads == 2) {
+        run_stack_throughput_bench<cds::HazardLockFreeStack<Payload, 2>>(
+            "haz2", message_count, threads, run_index);
+      } else {
+        run_stack_throughput_bench<cds::HazardLockFreeStack<Payload, 8>>(
+            "haz8", message_count, threads, run_index);
+      }
+    }
+  }
 
   return 0;
 }
