@@ -6,31 +6,26 @@ coherence floor and saturated throughput.
 
 ## Queues
 
-
 | Type | Synchronization | Progress |
 |---|---|---|
-| `SpscQueue<T, N>` | Monotonic head/tail cursors, acquire/release | Lock-free; operations are wait-free (no retry loops). Single-producer/single-consumer by contract. |
-| `SpinlockQueue<T, N>` | `std::atomic_flag` spinlock | Blocking (busy-wait). MPMC-safe. |
-| `MutexQueue<T, N>` | `std::mutex` | Blocking (OS-mediated). MPMC-safe. |
-| `MpmcQueue<T, N>` | Per-slot sequence numbers (Vyukov ring), CAS on the shared position counters | Lock-free. MPMC-safe, any number of producers/consumers. |
-
-Contended fields are optionally padded to a cache line (compile-time toggle,
-see below) to test false-sharing impact.
+| `SpscQueue<T, N>` | Monotonic head/tail cursors, acquire/release | Wait-free. SPSC only. |
+| `SpinlockQueue<T, N>` | `std::atomic_flag` spinlock | Blocking (busy-wait). MPMC. |
+| `MutexQueue<T, N>` | `std::mutex` | Blocking (OS-mediated). MPMC. |
+| `MpmcQueue<T, N>` | Per-slot sequence numbers (Vyukov ring), CAS on shared positions | Lock-free. MPMC. |
 
 ## Stacks
-
 
 | Type | Reclamation | Progress |
 |---|---|---|
 | `LockStack<T>` | `std::mutex` around a `std::stack` | Blocking (OS-mediated). |
 | `HazardLockFreeStack<T, N>` | Hazard pointers (`N` slots, one per live thread) | Lock-free. |
-| `QuiescentLockFreeStack<T>` | Quiescent-state — nodes freed once no thread is mid-`pop()` | Lock-free. |
+| `QuiescentLockFreeStack<T>` | Quiescent-state: nodes freed once no thread is mid-`pop()` | Lock-free. |
 | `SplitRefLockFreeStack<T>` | Split reference counting (external + internal counts in one CAS) | Lock-free. |
 
 ## Build & test
 
-Requires [Meson](https://mesonbuild.com) (>= 1.1) and Ninja. Supported build
-types are `debug` (tests) and `debugoptimized` (benchmarks and sanitizers).
+Requires [Meson](https://mesonbuild.com) >= 1.1 and Ninja. Use `debug` for
+tests and `debugoptimized` for benchmarks and sanitizers.
 
 ```sh
 # tests
@@ -41,60 +36,44 @@ meson test -C build-debug --print-errorlogs
 meson setup build --buildtype=debugoptimized
 meson compile -C build
 ./build/benchmarks/benchmark --messages=1000000 --repeats=30 --queue=all
-```
 
-ThreadSanitizer (requires `debugoptimized`; use `-Db_sanitize=address,undefined`
-for ASan/UBSan):
-
-```sh
+# sanitizers: -Db_sanitize=thread or -Db_sanitize=address,undefined
 meson setup build-tsan --buildtype=debugoptimized -Db_sanitize=thread
 meson test -C build-tsan --print-errorlogs
 ```
 
-Cache-line padding is a compile-time toggle (`-Dcache_padding`, default
-`true`). Build both ways into separate directories to A/B it:
-
-```sh
-meson setup build-pad   --buildtype=debugoptimized -Dcache_padding=true
-meson setup build-nopad --buildtype=debugoptimized -Dcache_padding=false
-```
+Contended fields are padded to their own cache line by default. Pass
+`-Dcache_padding=false` to a separate build directory to measure false sharing.
 
 ## Benchmark
 
-Three metrics, measured in separate runs so they never contaminate each other:
+Each metric is measured in a separate run:
 
-- **Hand-off latency** — depth-1 ping-pong through two SPSC queues (one
-  message in flight). Reports RTT p50/p90/p99/p99.9/max and a one-way
-  estimate (≈ RTT/2).
-- **Coherence floor** — the same ping-pong with a bare `std::atomic_flag`
-  instead of a queue, as a lower bound; queue latency is also reported as
-  overhead over this floor.
-- **Throughput** — saturated single-producer/single-consumer, Mmsg/s after
-  warm-up.
+- **Coherence floor**: depth-1 ping-pong on a bare `std::atomic_flag`, as a
+  lower bound for cross-core hand-off.
+- **Hand-off latency**: the same ping-pong through two queues. Reports RTT
+  percentiles, one-way (~RTT/2), and overhead over the floor.
+- **Throughput**: saturated 1 producer / 1 consumer, after warm-up.
+- **Contended MPMC**: 4 producers / 4 consumers on one `MpmcQueue`,
+  `SpinlockQueue` or `MutexQueue`.
+- **Stack throughput**: N threads each push then pop their share, N = 2 and 8.
 
-Two more target the new structures: **contended MPMC throughput** (4
-producers / 4 consumers on one queue instance — `MpmcQueue`, `SpinlockQueue`,
-`MutexQueue`; `SpscQueue` doesn't support this) and **stack throughput** (N
-threads each push then pop their share, at N=2 and N=8, across all four
-stacks). Both are timed launch-to-join rather than a precise warm-up
-cutpoint — at 200k+ messages, thread-launch skew is noise.
+The last two are timed launch-to-join; at 200k+ messages, thread-launch skew is
+noise.
 
-Methodology: spin-only retry (no yielding); warm-up drops the first
-`max(1%, 10k)` samples; each config runs N times, tables report median (IQR
-for throughput); empty payload isolates synchronization cost from
-message-copy cost; no core pinning on macOS, so tail figures (p99.9/max) are
-scheduler-inflated upper bounds, not pure contention cost.
+Retries spin without yielding. Warm-up drops the first `max(1%, 10k)` samples.
+The payload is empty, so results measure synchronization, not copying. macOS
+allows no core pinning, so tail figures (p99.9/max) include scheduler noise.
 
 ## Results
 
-Apple M1 Pro (8P+2E cores), macOS, capacity 1024, 200k messages/run, N=10.
-Medians (IQR for throughput) via `scripts/aggregate.py`.
+Apple M1 Pro (8P+2E), macOS, capacity 1024, 200k messages per run, 10 runs per
+config. Medians (and IQR for throughput) from `scripts/aggregate.py`.
 
-Coherence floor (RTT p50): **125 ns (padded), 84 ns (unpadded)**. This should
-be padding-invariant but isn't — a ≈49% gap, in the opposite direction from
-an earlier capture that also showed ≈49% — so it's scheduler noise on an
-unpinned macOS scheduler, not a padding effect. Each queue's "+over floor" is
-computed against its own build's baseline.
+The coherence floor (RTT p50) measured 125 ns padded and 84 ns unpadded. It
+should not depend on padding, and an earlier capture showed the opposite gap,
+so this is scheduler noise. Each queue's overhead is computed against its own
+build's floor.
 
 **Latency** (depth-1 ping-pong):
 
@@ -109,12 +88,11 @@ computed against its own build's baseline.
 | mutex | on | 16,375 ns | 153,521 ns | 8,188 ns | 16,250 ns |
 | mutex | off | 13,084 ns | 75,937 ns | 6,542 ns | 12,979 ns |
 
-Padding barely matters at depth 1 — only one message is ever in flight, so
-contended fields are never actually raced. `mpmc` lands right next to `spsc`
-despite being fully MPMC-safe: one CAS per op is about as cheap as `spsc`'s
-plain load/fetch-add here.
+Padding barely matters at depth 1, since with one message in flight the
+contended fields are never raced. `mpmc` matches `spsc`: one CAS per operation
+costs about as much as a plain load and fetch-add here.
 
-**Throughput** (Mmsg/s, single producer/single consumer):
+**Throughput** (Mmsg/s, 1 producer / 1 consumer):
 
 | Queue | Padding | Median | IQR |
 |---|---|---|---|
@@ -127,14 +105,12 @@ plain load/fetch-add here.
 | mutex | on | 19.1 | 17.0 – 19.6 |
 | mutex | off | 17.8 | 16.3 – 18.3 |
 
-Padding still matters for the two spin-based queues (`spsc` ≈2.7×,
-`spinlock` ≈4.5×); `mutex` is flat, since it's blocking-bound, not
-line-contention-bound. `mpmc`'s median beats `spsc`'s, but its per-run spread
-(45–125) is much wider than `spsc`'s tight 40–55 band — likely P/E core
-migration (no pinning on macOS) — so treat it as an optimistic case, not a
-stable number.
+Padding helps the spin-based queues (`spsc` ~2.7×, `spinlock` ~4.5×). `mutex`
+is unaffected because it is bound by blocking, not cache-line contention.
+`mpmc`'s median beats `spsc`'s, but its spread is far wider, likely from P/E
+core migration, so treat it as optimistic.
 
-**Contended MPMC** (4 producers / 4 consumers, one queue, padded build):
+**Contended MPMC** (Mmsg/s, 4 producers / 4 consumers, padded):
 
 | Queue | Median | IQR |
 |---|---|---|
@@ -142,15 +118,12 @@ stable number.
 | spinlock | 0.3 | 0.2 – 0.4 |
 | mutex | 13.6 | 12.9 – 15.2 |
 
-`spinlock`'s no-backoff retry loop collapses under real contention (≈20×
-worse than 1p/1c). More interesting: `mutex` beats `mpmc` by ≈3× here,
-inverting their 1p/1c ranking — `mpmc`'s CAS loop on
-`enqueue_pos_`/`dequeue_pos_` has the same no-backoff problem once 8 threads
-contend on it, while a blocking mutex parks waiting threads instead of
-burning cycles. Lock-free isn't automatically faster; it depends on
-contention level and whether the retry loop backs off.
+`spinlock` collapses under contention (~20× worse than 1p/1c). `mutex` beats
+`mpmc` by ~3×, reversing the 1p/1c ranking: `mpmc`'s CAS loop on the shared
+positions has no backoff, so 8 threads burn cycles retrying, while a mutex parks
+waiters. Lock-free is not automatically faster.
 
-**Stack throughput** (N threads push then pop their share, padded build):
+**Stack throughput** (Mmsg/s, padded):
 
 | Stack | 2 threads | 8 threads |
 |---|---|---|
@@ -159,16 +132,8 @@ contention level and whether the retry loop backs off.
 | `QuiescentLockFreeStack` | 7.2 | 1.5 |
 | `HazardLockFreeStack` | 6.7 | 1.8 |
 
-`LockStack` wins outright (≈5× at 2 threads, ≈12–15× at 8) despite one global
-mutex — but not because of the lock. All three lock-free stacks `new`/
-`delete` a node per operation, while `LockStack`'s `std::deque` amortizes
-allocation; this benchmark mostly measures allocator contention. The
-lock-free stacks land within noise of each other, consistent with that
-shared cost swamping whatever they do differently (hazard pointers vs.
-quiescent-state vs. split refcounting).
-
-
-## AI disclosure
-
-Core data structure logic written by me.
-AI assisted with build files, commit management, testing, aggregate script gen, and this README.
+`LockStack` wins (~5× at 2 threads, ~12–15× at 8), but not because of the
+lock. The lock-free stacks allocate and free a node per operation, while
+`std::stack`'s underlying `std::deque` amortizes allocation, so this mostly
+measures allocator contention. That shared cost also explains why the three
+lock-free stacks land within noise of each other.
