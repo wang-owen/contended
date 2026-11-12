@@ -29,32 +29,34 @@ see below) to test false-sharing impact.
 
 ## Build & test
 
+Requires [Meson](https://mesonbuild.com) (>= 1.1) and Ninja. Supported build
+types are `debug` (tests) and `debugoptimized` (benchmarks and sanitizers).
+
 ```sh
 # tests
-cmake -S . -B build-debug -DCMAKE_BUILD_TYPE=Debug
-cmake --build build-debug
-ctest --test-dir build-debug --output-on-failure
+meson setup build-debug --buildtype=debug
+meson test -C build-debug --print-errorlogs
 
 # benchmark
-cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build
+meson setup build --buildtype=debugoptimized
+meson compile -C build
 ./build/benchmarks/benchmark --messages=1000000 --repeats=30 --queue=all
 ```
 
-ThreadSanitizer (requires `RelWithDebInfo`):
+ThreadSanitizer (requires `debugoptimized`; use `-Db_sanitize=address,undefined`
+for ASan/UBSan):
 
 ```sh
-cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCDS_ENABLE_TSAN=ON
-cmake --build build-tsan
-ctest --test-dir build-tsan --output-on-failure
+meson setup build-tsan --buildtype=debugoptimized -Db_sanitize=thread
+meson test -C build-tsan --print-errorlogs
 ```
 
-Cache-line padding is a compile-time toggle (`CDS_ENABLE_CACHE_PADDING`,
-default ON). Build both ways into separate directories to A/B it:
+Cache-line padding is a compile-time toggle (`-Dcache_padding`, default
+`true`). Build both ways into separate directories to A/B it:
 
 ```sh
-cmake -S . -B build-pad   -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCDS_ENABLE_CACHE_PADDING=ON
-cmake -S . -B build-nopad -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCDS_ENABLE_CACHE_PADDING=OFF
+meson setup build-pad   --buildtype=debugoptimized -Dcache_padding=true
+meson setup build-nopad --buildtype=debugoptimized -Dcache_padding=false
 ```
 
 ## Benchmark

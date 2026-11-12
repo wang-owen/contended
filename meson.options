@@ -1,0 +1,8 @@
+option('tests', type: 'boolean', value: true, description: 'Build tests')
+option('benchmarks', type: 'boolean', value: true, description: 'Build benchmarks')
+option(
+  'cache_padding',
+  type: 'boolean',
+  value: true,
+  description: 'Pad contended atomics/locks to their own cache line to prevent false sharing',
+)
