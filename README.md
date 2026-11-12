@@ -1,4 +1,4 @@
-# concurrent-ds-bench
+# contended
 
 Bounded, fixed-capacity concurrent data structures in C++20, with a benchmark
 harness that measures cross-core hand-off latency against a hardware

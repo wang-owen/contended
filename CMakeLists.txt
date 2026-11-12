@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(concurrent_ds_bench CXX)
+project(contended CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
